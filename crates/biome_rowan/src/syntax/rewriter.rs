@@ -4,9 +4,12 @@ use crate::{Language, SyntaxNode, SyntaxSlot, SyntaxToken};
 
 /// A visitor that re-writes a syntax tree while visiting the nodes.
 ///
-/// The rewriter visits the nodes in pre-order from top-down.
-/// Meaning, it first visits the `root`, and then visits the children of the root from left to right,
-/// recursively traversing into child nodes and calling [`visit_node`](SyntaxRewriter) for every node.
+/// The rewriter visits nodes in both pre-order and post-order:
+/// 1. [`visit_node`](SyntaxRewriter::visit_node) is called before processing children (pre-order)
+/// 2. Children are processed recursively from left to right
+/// 3. [`visit_node_post`](SyntaxRewriter::visit_node_post) is called after children are processed (post-order)
+///
+/// This enables transformations where parent modifications depend on child transformations.
 ///
 /// Inspired by Roslyn's [`CSharpSyntaxRewriter`](https://docs.microsoft.com/en-us/dotnet/api/microsoft.codeanalysis.csharp.csharpsyntaxrewriter?view=roslyn-dotnet-4.2.0)
 ///
@@ -147,6 +150,21 @@ pub trait SyntaxRewriter {
     fn visit_token(&mut self, token: SyntaxToken<Self::Language>) -> SyntaxToken<Self::Language> {
         token
     }
+
+    /// Called after a node's children have been visited (post-order).
+    ///
+    /// This hook receives the node with all child transformations already applied.
+    /// This makes it possible to compose transformations at multiple depths in the tree.
+    /// The default implementation returns the node unchanged.
+    ///
+    /// **Note**: This is NOT called when [`visit_node`](SyntaxRewriter::visit_node) returns
+    /// [`Replace`](VisitNodeSignal::Replace), since pre-order replacement bypasses child traversal entirely.
+    fn visit_node_post(
+        &mut self,
+        node: SyntaxNode<Self::Language>,
+    ) -> SyntaxNode<Self::Language> {
+        node
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,11 +208,13 @@ where
         }
     }
 
-    parent
+    rewriter.visit_node_post(parent)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
+
     use crate::raw_language::{RawLanguage, RawLanguageKind, RawSyntaxTreeBuilder};
     use crate::{SyntaxNode, SyntaxRewriter, SyntaxToken, VisitNodeSignal};
 
@@ -254,5 +274,136 @@ mod tests {
             self.tokens.push(token.clone());
             token
         }
+    }
+
+    #[test]
+    fn test_visit_node_post_called_after_children() {
+        let mut builder = RawSyntaxTreeBuilder::new();
+
+        builder.start_node(RawLanguageKind::ROOT);
+        builder.start_node(RawLanguageKind::LITERAL_EXPRESSION);
+        builder.token(RawLanguageKind::NUMBER_TOKEN, "5");
+        builder.finish_node();
+        builder.finish_node();
+
+        let root = builder.finish();
+
+        #[derive(Default)]
+        struct PostOrderRecorder {
+            post_nodes: Vec<RawLanguageKind>,
+        }
+
+        impl SyntaxRewriter for PostOrderRecorder {
+            type Language = RawLanguage;
+
+            fn visit_node_post(&mut self, node: SyntaxNode<Self::Language>) -> SyntaxNode<Self::Language> {
+                self.post_nodes.push(node.kind());
+                node
+            }
+        }
+
+        let mut recorder = PostOrderRecorder::default();
+        recorder.transform(root);
+
+        // Post-order: children before parents
+        assert_eq!(
+            recorder.post_nodes,
+            vec![RawLanguageKind::LITERAL_EXPRESSION, RawLanguageKind::ROOT]
+        );
+    }
+
+    #[test]
+    fn test_visit_node_post_sees_transformed_children() {
+        let mut builder = RawSyntaxTreeBuilder::new();
+
+        builder.start_node(RawLanguageKind::ROOT);
+        builder.start_node(RawLanguageKind::LITERAL_EXPRESSION);
+        builder.token(RawLanguageKind::NUMBER_TOKEN, "5");
+        builder.finish_node();
+        builder.finish_node();
+
+        let root = builder.finish();
+
+        struct ChildTransformer {
+            saw_transformed_child: bool,
+        }
+
+        impl SyntaxRewriter for ChildTransformer {
+            type Language = RawLanguage;
+
+            fn visit_node(&mut self, node: SyntaxNode<Self::Language>) -> VisitNodeSignal<Self::Language> {
+                // Replace LITERAL_EXPRESSION with BOGUS
+                if node.kind() == RawLanguageKind::LITERAL_EXPRESSION {
+                    let bogus = SyntaxNode::new_detached(
+                        RawLanguageKind::BOGUS,
+                        iter::once(node.first_token().map(|t| t.into())),
+                    );
+                    VisitNodeSignal::Replace(bogus)
+                } else {
+                    VisitNodeSignal::Traverse(node)
+                }
+            }
+
+            fn visit_node_post(&mut self, node: SyntaxNode<Self::Language>) -> SyntaxNode<Self::Language> {
+                if node.kind() == RawLanguageKind::ROOT {
+                    self.saw_transformed_child = node
+                        .first_child()
+                        .is_some_and(|child| child.kind() == RawLanguageKind::BOGUS);
+                }
+                node
+            }
+        }
+
+        let mut transformer = ChildTransformer {
+            saw_transformed_child: false,
+        };
+        transformer.transform(root);
+
+        assert!(
+            transformer.saw_transformed_child,
+            "visit_node_post should see the transformed child"
+        );
+    }
+
+    #[test]
+    fn test_replace_skips_visit_node_post() {
+        let mut builder = RawSyntaxTreeBuilder::new();
+        builder.start_node(RawLanguageKind::ROOT);
+        builder.start_node(RawLanguageKind::LITERAL_EXPRESSION);
+        builder.token(RawLanguageKind::NUMBER_TOKEN, "5");
+        builder.finish_node();
+        builder.finish_node();
+        let root = builder.finish();
+
+        #[derive(Default)]
+        struct ReplaceAndRecord {
+            post_visited_kinds: Vec<RawLanguageKind>,
+        }
+
+        impl SyntaxRewriter for ReplaceAndRecord {
+            type Language = RawLanguage;
+
+            fn visit_node(&mut self, node: SyntaxNode<Self::Language>) -> VisitNodeSignal<Self::Language> {
+                if node.kind() == RawLanguageKind::LITERAL_EXPRESSION {
+                    let bogus = SyntaxNode::new_detached(
+                        RawLanguageKind::BOGUS,
+                        iter::once(node.first_token().map(|t| t.into())),
+                    );
+                    VisitNodeSignal::Replace(bogus)
+                } else {
+                    VisitNodeSignal::Traverse(node)
+                }
+            }
+
+            fn visit_node_post(&mut self, node: SyntaxNode<Self::Language>) -> SyntaxNode<Self::Language> {
+                self.post_visited_kinds.push(node.kind());
+                node
+            }
+        }
+
+        let mut rewriter = ReplaceAndRecord::default();
+        rewriter.transform(root);
+
+        assert_eq!(rewriter.post_visited_kinds, vec![RawLanguageKind::ROOT]);
     }
 }
